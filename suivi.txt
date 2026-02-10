@@ -1,3 +1,6 @@
 09/02/26 Léo: Début du projet, fichier .cpp,.h et .ino pour prendre l'entrée (micro) et renvoyer directement vers la sortie (casque).
 J'ai pas pu test car le teensy avec l'entrée micro a un problème d'audio, rien de sort et rien de rentre. 
 Pour les étapes pour arriver à un bon gender switch, voir le readme. J'ai pensé qu'on pourrait faire 2 gender switchs: homme->femme et femme->homme et faire une jolie boite avec le micro qui sort, un bouton pour changer le mode de gender switch (voir photo dispositif).
+
+10/02/26 Léo: J'ai refait un peu depuis le début psq Faust marchait grave pas. J'ai fait tout dans le fichier .ino avec la bibliothèque audio de Arduino, on découpera en plusieurs fichiers plus tard si nécessaire. J'ai enlevé les étapes de pré processing pour qu'on ait déjà une base qui marche et ensuite on s'attardera sur du pre-processing/post-processing. 
+Actuellement on a le pitch shifting qui fonctionne bien ainsi que l'augmentation de la fréquence des formants. Avec les valeurs par défaut que j'ai mis on a presque un résultat femme. Le résultat est sympa mais y'aura encore des trucs à ajouter: la brightness de la voix, les femmes ont une voix plus forte dans les aigus médiums que les hommes qui eux accentuent dans les graves. Je t'explique demain ce que sont les formants et pitch shifting stv ou va voir sur internet.
