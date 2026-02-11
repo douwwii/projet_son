@@ -4,3 +4,6 @@ Pour les étapes pour arriver à un bon gender switch, voir le readme. J'ai pens
 
 10/02/26 Léo: J'ai refait un peu depuis le début psq Faust marchait grave pas. J'ai fait tout dans le fichier .ino avec la bibliothèque audio de Arduino, on découpera en plusieurs fichiers plus tard si nécessaire. J'ai enlevé les étapes de pré processing pour qu'on ait déjà une base qui marche et ensuite on s'attardera sur du pre-processing/post-processing. 
 Actuellement on a le pitch shifting qui fonctionne bien ainsi que l'augmentation de la fréquence des formants. Avec les valeurs par défaut que j'ai mis on a presque un résultat femme. Le résultat est sympa mais y'aura encore des trucs à ajouter: la brightness de la voix, les femmes ont une voix plus forte dans les aigus médiums que les hommes qui eux accentuent dans les graves. Je t'explique demain ce que sont les formants et pitch shifting stv ou va voir sur internet.
+
+11/02/26 Léo: Ajout d'éléments pour rendre la voix plus féminine passe-haut "air" à 6000Hz car les femmes laissent + passer à ces hautes fréquences. Passe-bas à 120Hz car les femmes laissent peu passer ces fréquences. Fréquences formants ajustables au clavier.
+Ajout de la possibilité de filtre H->F ou F->H, c'est le même principe dans les 2 sens on fait juste les changements dans le sens inverse.
