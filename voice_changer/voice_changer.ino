@@ -72,6 +72,7 @@ AudioOutputI2S       out;
 // Mesures (debug) : pic et RMS pour vérifier niveau et clipping
 AudioAnalyzePeak     peakIn;
 AudioAnalyzeRMS      rmsIn;
+AudioAnalyzeFFT1024  fftIn;
 
 // Contrôleur de la puce audio shield (gain micro, volume, etc.)
 AudioControlSGTL5000 sgtl5000;
