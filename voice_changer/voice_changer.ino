@@ -325,11 +325,11 @@ static void applyPreset(VoiceMode m) {
 
   // Paramètres de base pour chaque transformation
   if (mode == MODE_M2F) {
-    speed      = 1.24f;  // pitch up
-    grainMs    = 60.0f;
-    wet        = 0.85f;
-    formantAmt = 0.60f;  // formants up
-    lowCutHz   = 140.0f; // coupe le grave “poitrine”
+    speed      = 1.22f;  // pitch up
+    grainMs    = 70.0f;
+    wet        = 0.90f;
+    formantAmt = 0.50f;  // formants up
+    lowCutHz   = 120.0f; // coupe le grave “poitrine”
     airAmt     = 0.20f;  // un peu d’air
   } else { // MODE_F2M
     speed      = 0.82f;  // pitch down modéré (évite “monstre”)
