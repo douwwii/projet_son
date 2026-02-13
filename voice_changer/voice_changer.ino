@@ -72,7 +72,6 @@ AudioOutputI2S       out;
 // Mesures (debug) : pic et RMS pour vérifier niveau et clipping
 AudioAnalyzePeak     peakIn;
 AudioAnalyzeRMS      rmsIn;
-AudioAnalyzeFFT1024  fftIn;
 
 // FFT pour détecter dynamiquement les pics de formants (F1/F2/F3)
 AudioAnalyzeFFT1024  fftIn;
