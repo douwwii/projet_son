@@ -73,6 +73,9 @@ AudioOutputI2S       out;
 AudioAnalyzePeak     peakIn;
 AudioAnalyzeRMS      rmsIn;
 
+// FFT pour détecter dynamiquement les pics de formants (F1/F2/F3)
+AudioAnalyzeFFT1024  fftIn;
+
 // Contrôleur de la puce audio shield (gain micro, volume, etc.)
 AudioControlSGTL5000 sgtl5000;
 
@@ -87,6 +90,7 @@ AudioConnection c1(mic, 0, preamp, 0);
 // preamp -> analyzers (uniquement pour affichage, n’altère pas le son)
 AudioConnection c3(preamp, 0, peakIn, 0);
 AudioConnection c4(preamp, 0, rmsIn, 0);
+AudioConnection cFFT(preamp, 0, fftIn, 0);
 
 // preamp -> lowCut (entrée du filtre)
 AudioConnection cLC_in(preamp, 0, lowCut, 0);
@@ -159,6 +163,21 @@ float outGain = 1.0f;    // gain global appliqué aux deux voies dry et wet
 float formantAmt = 0.55f; // intensité de l’effet “formants” (0..1)
 float lowCutHz   = 140.0f;// fréquence de coupure du high-pass (enlève grave “poitrine”)
 float airAmt     = 0.20f; // quantité d’“air” (boost haut-aigu), à doser pour éviter sifflantes
+
+
+// --- Formants dynamiques (détection FFT) ---
+// Objectif : estimer F1/F2/F3 sur la voix entrante et déplacer nos filtres autour de ces pics.
+// Ça évite d'avoir des fréquences fixes qui ne collent pas à toutes les voyelles / personnes.
+bool  dynamicFormants = true;   // toggle 't' sur Serial
+float trackedF1 = 550.0f;       // Hz (valeurs de départ "safe")
+float trackedF2 = 1500.0f;      // Hz
+float trackedF3 = 2500.0f;      // Hz
+float trackAlpha = 0.20f;       // 0..1 : plus grand = suit plus vite mais moins stable
+elapsedMillis formantTrackTimer;
+const uint32_t FORMANT_TRACK_PERIOD_MS = 35; // ~30 Hz (assez réactif sans trop charger le CPU)
+
+// Garde-fous : si l'entrée est trop faible, on "gèle" les formants
+float rmsGate = 0.012f; // à ajuster : plus grand = nécessite une voix plus forte
 
 
 // ============================================================
@@ -278,6 +297,78 @@ static void applyAir(float amt) {
   wetMix.gain(3, 0.0f);
 }
 
+
+// ============================================================
+// 6bis) FORMANTS DYNAMIQUES : estimation FFT + suivi (F1/F2/F3)
+// ============================================================
+
+// Convertit une fréquence en index de bin FFT (FFT1024 -> résolution ~43 Hz)
+static inline int binFromHz(float hz) {
+  constexpr float fs = AUDIO_SAMPLE_RATE_EXACT;  // 44117.6 Hz typique
+  int b = (int)lroundf(hz * 1024.0f / fs);
+  if (b < 0) b = 0;
+  if (b > 511) b = 511; // FFT1024 : bins 0..511 (0..fs/2)
+  return b;
+}
+
+// Cherche un pic (max d'énergie) dans une bande [loHz, hiHz]
+static float findPeakHzInBand(float loHz, float hiHz) {
+  int lo = binFromHz(loHz);
+  int hi = binFromHz(hiHz);
+  if (hi <= lo) hi = lo + 1;
+
+  float bestMag = 0.0f;
+  int bestBin = lo;
+
+  // Astuce : on évite les tout premiers bins (DC / rumble) en bornant loHz correctement
+  for (int b = lo; b <= hi; ++b) {
+    float m = fftIn.read(b); // magnitude du bin
+    if (m > bestMag) {
+      bestMag = m;
+      bestBin = b;
+    }
+  }
+
+  // Convertit bin -> Hz
+  constexpr float fs = AUDIO_SAMPLE_RATE_EXACT;
+  float hz = (bestBin * fs) / 1024.0f;
+  return hz;
+}
+
+// Met à jour trackedF1/F2/F3 si l'FFT est dispo, avec un filtre passe-bas (smoothing)
+static void updateDynamicFormants() {
+  // Périodicité contrôlée (évite de faire trop souvent des scans)
+  if (formantTrackTimer < FORMANT_TRACK_PERIOD_MS) return;
+  formantTrackTimer = 0;
+
+  // Gating sur niveau d'entrée (évite de "tracker" le bruit)
+  float rms = 0.0f;
+  if (rmsIn.available()) rms = rmsIn.read();
+  if (rms < rmsGate) return;
+
+  if (!fftIn.available()) return;
+
+  // Bandes typiques (voix humaine) :
+  // F1 ~ 250..900 Hz ; F2 ~ 800..2500 Hz ; F3 ~ 2000..4000 Hz
+  // On fait un léger recouvrement pour ne pas rater certaines voyelles.
+  float f1 = findPeakHzInBand(250.0f, 1000.0f);
+  float f2 = findPeakHzInBand(800.0f, 2600.0f);
+  float f3 = findPeakHzInBand(1800.0f, 4200.0f);
+
+  // Sécurité : ordre croissant (sinon on garde l'ancien)
+  if (!(f1 < f2 && f2 < f3)) return;
+
+  // Smoothing (IIR 1er ordre)
+  trackedF1 += trackAlpha * (f1 - trackedF1);
+  trackedF2 += trackAlpha * (f2 - trackedF2);
+  trackedF3 += trackAlpha * (f3 - trackedF3);
+
+  // Bornes de sécurité (évite des valeurs absurdes)
+  trackedF1 = clampf(trackedF1, 250.0f, 1200.0f);
+  trackedF2 = clampf(trackedF2, 700.0f, 3000.0f);
+  trackedF3 = clampf(trackedF3, 1400.0f, 5000.0f);
+}
+
 /*
   applyFormant :
   - met à jour les fréquences centrales des 3 formants (svf1/2/3)
@@ -293,29 +384,45 @@ static void applyFormant(VoiceMode m, float amt) {
   float f1, f2, f3;
   float q1, q2, q3;
 
+  // --- 1) Choix des "formants de référence" ---
+  // - si dynamicFormants ON : on part de trackedF1/2/3 (estimés via FFT)
+  // - sinon : on part de valeurs fixes (plus simple, moins adaptatif)
+  float baseF1, baseF2, baseF3;
+  if (dynamicFormants) {
+    baseF1 = trackedF1;
+    baseF2 = trackedF2;
+    baseF3 = trackedF3;
+  } else {
+    baseF1 = 900.0f;
+    baseF2 = 1800.0f;
+    baseF3 = 3000.0f;
+  }
+
+  // --- 2) Application d'un ratio de déplacement ---
+  // Ici on ne fait PAS un vrai "formant shifter" (qui déplacerait tout le spectre),
+  // mais un shaper simple : 3 résonances bandpass qu'on déplace.
+  // Le ratio dépend du mode + de amt.
+  float ratio = 1.0f;
   if (m == MODE_M2F) {
-    // M -> F : on monte les formants
-    f1 = 900.0f  + 250.0f * amt;   // 900 -> 1250
-    f2 = 1800.0f + 450.0f * amt;   // 1800 -> 2450
-    f3 = 3000.0f + 500.0f * amt;   // 3000 -> 3700
+    ratio = 1.00f + 0.40f * amt;   // 1.00 -> 1.40
     q1 = 2.0f + 0.8f * amt;
     q2 = 2.4f + 1.0f * amt;
     q3 = 2.6f + 1.0f * amt;
   } else if (m == MODE_F2M) {
-    // F -> M : on descend les formants (attention : trop bas = voix “boueuse”)
-    f1 = 850.0f  - 250.0f * amt;   // 850 -> 600
-    f2 = 1700.0f - 450.0f * amt;   // 1700 -> 1250
-    f3 = 2800.0f - 600.0f * amt;   // 2800 -> 2200
+    ratio = 1.00f - 0.25f * amt;   // 1.00 -> 0.75
     q1 = 1.8f + 0.5f * amt;
     q2 = 2.0f + 0.7f * amt;
     q3 = 2.2f + 0.7f * amt;
   } else {
-    // BYPASS : neutre
-    f1 = 900.0f; f2 = 1800.0f; f3 = 3000.0f;
-    q1 = 2.0f;   q2 = 2.4f;    q3 = 2.6f;
+    ratio = 1.0f;
+    q1 = 2.0f; q2 = 2.4f; q3 = 2.6f;
   }
 
-  // Sécurité : on borne les fréquences
+  f1 = baseF1 * ratio;
+  f2 = baseF2 * ratio;
+  f3 = baseF3 * ratio;
+
+  // --- 3) Bornes de sécurité ---
   f1 = clampf(f1, 300.0f, 2000.0f);
   f2 = clampf(f2, 600.0f, 3500.0f);
   f3 = clampf(f3, 1200.0f, 5000.0f);
@@ -324,7 +431,7 @@ static void applyFormant(VoiceMode m, float amt) {
   svf1.frequency(f1); svf2.frequency(f2); svf3.frequency(f3);
   svf1.resonance(q1); svf2.resonance(q2); svf3.resonance(q3);
 
-  // Mix : direct vs bandes
+  // Mix : direct vs bandes (on garde ta logique)
   if (m == MODE_M2F) {
     float direct = 1.0f - 0.40f * amt;
     formantMixer.gain(0, direct);
@@ -344,7 +451,6 @@ static void applyFormant(VoiceMode m, float amt) {
     formantMixer.gain(3, 0.0f);
   }
 }
-
 /*
   reconfigureGranular :
   - configure le pitch shift avec grainMs
@@ -480,6 +586,7 @@ static void printMenu() {
   Serial.println("  b : bypass on/off");
   Serial.println("  s : status");
   Serial.println("  r : reset preset courant");
+  Serial.println("  t : toggle formants dynamiques (FFT)");
 }
 
 static void printStatus() {
@@ -492,7 +599,14 @@ static void printStatus() {
   Serial.print("  air="); Serial.print(airAmt, 2);
   Serial.print("  lowCut="); Serial.print(lowCutHz, 0); Serial.print("Hz");
   Serial.print("  outGain="); Serial.print(outGain, 2);
-  Serial.print("  bypass="); Serial.println(bypass ? "ON" : "OFF");
+  Serial.print("  bypass="); Serial.print(bypass ? "ON" : "OFF");
+  Serial.print("  dynFormants="); Serial.println(dynamicFormants ? "ON" : "OFF");
+  if (dynamicFormants) {
+    Serial.print("tracked F1/F2/F3=");
+    Serial.print(trackedF1, 0); Serial.print(" / ");
+    Serial.print(trackedF2, 0); Serial.print(" / ");
+    Serial.print(trackedF3, 0); Serial.println(" Hz");
+  }
 
   // Affiche peak/RMS si disponibles (la lib met à jour périodiquement)
   if (peakIn.available()) {
@@ -535,6 +649,9 @@ void setup() {
   // Gain logiciel (laisser à 1 au début)
   preamp.gain(1.0f);
 
+  // FFT : fenêtre Hanning pour stabiliser les pics
+  fftIn.windowFunction(AudioWindowHanning1024);
+
   // Donne la RAM au granular (obligatoire)
   granular.begin(granularMemory, GRANULAR_MEMORY_SIZE);
 
@@ -564,6 +681,13 @@ void setup() {
 void loop() {
   updatePitchFromPot();
   updateWetFromPot();
+
+  // Tracking des formants (si activé) : met à jour trackedF1/F2/F3 via FFT
+  if (dynamicFormants && !bypass && mode != MODE_BYPASS) {
+    updateDynamicFormants();
+    // On recalcule les filtres autour des formants suivis
+    applyFormant(mode, formantAmt);
+  }
 
   // Bouton mode (A0) : bascule M2F <-> F2M
   bool btnNow = digitalRead(MODE_BTN_PIN); // HIGH=repos, LOW=appuyé
@@ -678,6 +802,13 @@ void loop() {
     // ------------------ Reset preset courant ------------------
     case 'r':
       applyPreset(mode);
+      break;
+
+    // ------------------ Toggle formants dynamiques ------------------
+    case 't':
+      dynamicFormants = !dynamicFormants;
+      // (re)applique immédiatement
+      applyFormant(mode, formantAmt);
       break;
 
     // ------------------ Status ------------------
