@@ -72,6 +72,7 @@ AudioOutputI2S       out;
 // Mesures (debug) : pic et RMS pour vérifier niveau et clipping
 AudioAnalyzePeak     peakIn;
 AudioAnalyzeRMS      rmsIn;
+AudioAnalyzeFFT1024  fftIn;
 
 // Contrôleur de la puce audio shield (gain micro, volume, etc.)
 AudioControlSGTL5000 sgtl5000;
@@ -87,6 +88,7 @@ AudioConnection c1(mic, 0, preamp, 0);
 // preamp -> analyzers (uniquement pour affichage, n’altère pas le son)
 AudioConnection c3(preamp, 0, peakIn, 0);
 AudioConnection c4(preamp, 0, rmsIn, 0);
+AudioConnection cFFT(preamp, 0, fftIn, 0);
 
 // preamp -> lowCut (entrée du filtre)
 AudioConnection cLC_in(preamp, 0, lowCut, 0);
@@ -167,10 +169,11 @@ float airAmt     = 0.20f; // quantité d’“air” (boost haut-aigu), à doser
 
 constexpr uint8_t PITCH_POT_PIN = A8;
 
-// Plage du pitch : à ajuster selon ton besoin
-// M2F = plutôt > 1, F2M = plutôt < 1
-float potMinSpeed = 0.55f;
-float potMaxSpeed = 1.90f;
+// Plages du pitch selon le mode
+float potMinSpeed_M2F = 1.00f;
+float potMaxSpeed_M2F = 1.90f;
+float potMinSpeed_F2M = 0.55f;
+float potMaxSpeed_F2M = 1.00f;
 
 // Lissage (0..1) : plus grand = plus lisse mais plus lent
 float potSmooth = 0.08f;
@@ -190,9 +193,11 @@ static elapsedMillis potTimer;
 
 constexpr uint8_t WET_POT_PIN = A4;
 
-// Plage de mix wet
-float potMinWet = 0.0f;
-float potMaxWet = 1.0f;
+// Plages de mix wet selon le mode
+float potMinWet_M2F = 0.40f;
+float potMaxWet_M2F = 1.00f;
+float potMinWet_F2M = 0.40f;
+float potMaxWet_F2M = 1.00f;
 
 float wetPotSmooth = 0.08f;
 static float wetPotFiltered = 0.0f;
@@ -211,6 +216,22 @@ constexpr uint8_t MODE_BTN_PIN = A0;
 constexpr uint32_t MODE_BTN_DEBOUNCE_MS = 35;
 static elapsedMillis modeBtnTimer;
 static bool modeBtnPrev = true; // INPUT_PULLUP => repos = HIGH
+
+
+// ============================================================
+// 13) AUTO-DETECTION F0 (pitch) POUR SWITCH M2F/F2M
+// ============================================================
+
+bool autoMode = true;
+constexpr uint32_t AUTO_PERIOD_MS = 120;
+static elapsedMillis autoTimer;
+static float autoF0Smooth = 0.0f;
+
+// Hystérésis (évite le pompage)
+constexpr float AUTO_F0_LOW  = 155.0f;  // sous -> M2F
+constexpr float AUTO_F0_HIGH = 175.0f;  // au-dessus -> F2M
+
+constexpr float AUTO_MIN_PEAK = 0.01f;  // ignore si niveau trop faible
 
 
 // ============================================================
@@ -402,6 +423,20 @@ static void applyPreset(VoiceMode m) {
 }
 
 /*
+  applyModeSwitch :
+  - change le mode sans écraser les réglages utilisateur (pots)
+*/
+static void applyModeSwitch(VoiceMode m) {
+  mode = m;
+  bypass = false;
+  reconfigureGranular();
+  applyLowCut(lowCutHz);
+  applyFormant(mode, formantAmt);
+  applyAir(airAmt);
+  applyDryWet(bypass, wet, outGain);
+}
+
+/*
   updatePitchFromPot :
   - lit le potentiomètre sur A8
   - lisse la valeur
@@ -417,7 +452,16 @@ static void updatePitchFromPot() {
 
   float x = potFiltered / 4095.0f;            // normalisé 0..1
 
-  float newSpeed = potMinSpeed + x * (potMaxSpeed - potMinSpeed);
+  float minS, maxS;
+  if (mode == MODE_M2F) {
+    minS = potMinSpeed_M2F; maxS = potMaxSpeed_M2F;
+  } else if (mode == MODE_F2M) {
+    minS = potMinSpeed_F2M; maxS = potMaxSpeed_F2M;
+  } else {
+    minS = 1.0f; maxS = 1.0f; // bypass = neutre
+  }
+
+  float newSpeed = minS + x * (maxS - minS);
   newSpeed = clampf(newSpeed, 0.50f, 2.50f);
 
   if (fabsf(newSpeed - speed) > SPEED_EPS) {
@@ -442,12 +486,69 @@ static void updateWetFromPot() {
 
   float x = wetPotFiltered / 4095.0f;         // normalisé 0..1
 
-  float newWet = potMinWet + x * (potMaxWet - potMinWet);
+  float minW, maxW;
+  if (mode == MODE_M2F) {
+    minW = potMinWet_M2F; maxW = potMaxWet_M2F;
+  } else if (mode == MODE_F2M) {
+    minW = potMinWet_F2M; maxW = potMaxWet_F2M;
+  } else {
+    minW = potMinWet_M2F; maxW = potMaxWet_M2F;
+  }
+
+  float newWet = minW + x * (maxW - minW);
   newWet = clampf(newWet, 0.0f, 1.0f);
 
   if (fabsf(newWet - wet) > WET_EPS) {
     wet = newWet;
     applyDryWet(bypass, wet, outGain);
+  }
+}
+
+/*
+  estimateF0 :
+  - estime F0 via FFT dans 80..300 Hz
+  - retourne -1 si pas fiable
+*/
+static float estimateF0() {
+  if (!fftIn.available()) return -1.0f;
+
+  const float binHz = AUDIO_SAMPLE_RATE_EXACT / 1024.0f;
+  int binStart = (int)(80.0f / binHz);
+  int binEnd   = (int)(300.0f / binHz);
+
+  float maxVal = 0.0f;
+  int maxBin = -1;
+  for (int i = binStart; i <= binEnd; ++i) {
+    float v = fftIn.read(i);
+    if (v > maxVal) {
+      maxVal = v;
+      maxBin = i;
+    }
+  }
+
+  if (maxBin < 0 || maxVal < AUTO_MIN_PEAK) return -1.0f;
+  return maxBin * binHz;
+}
+
+/*
+  updateAutoMode :
+  - estime F0 et bascule entre M2F/F2M
+*/
+static void updateAutoMode() {
+  if (!autoMode) return;
+  if (autoTimer < AUTO_PERIOD_MS) return;
+  autoTimer = 0;
+
+  float f0 = estimateF0();
+  if (f0 <= 0.0f) return;
+
+  if (autoF0Smooth <= 0.0f) autoF0Smooth = f0;
+  autoF0Smooth += 0.20f * (f0 - autoF0Smooth);
+
+  if (mode == MODE_M2F && autoF0Smooth > AUTO_F0_HIGH) {
+    applyModeSwitch(MODE_F2M);
+  } else if (mode == MODE_F2M && autoF0Smooth < AUTO_F0_LOW) {
+    applyModeSwitch(MODE_M2F);
   }
 }
 
@@ -545,6 +646,8 @@ void setup() {
   reconfigureGranular();
   applyDryWet(bypass, wet, outGain);
 
+  fftIn.windowFunction(AudioWindowHanning1024);
+
   Serial.println("\n=== Voice Gender Switcher (0/1/2) ===");
   printMenu();
 
@@ -564,6 +667,7 @@ void setup() {
 void loop() {
   updatePitchFromPot();
   updateWetFromPot();
+  updateAutoMode();
 
   // Bouton mode (A0) : bascule M2F <-> F2M
   bool btnNow = digitalRead(MODE_BTN_PIN); // HIGH=repos, LOW=appuyé
