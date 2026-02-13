@@ -2,6 +2,7 @@
 #include <Audio.h>
 #include <Wire.h>
 #include <SPI.h>
+#include <math.h>
 
 /*
   ============================================================
@@ -158,6 +159,58 @@ float outGain = 1.0f;    // gain global appliqué aux deux voies dry et wet
 float formantAmt = 0.55f; // intensité de l’effet “formants” (0..1)
 float lowCutHz   = 140.0f;// fréquence de coupure du high-pass (enlève grave “poitrine”)
 float airAmt     = 0.20f; // quantité d’“air” (boost haut-aigu), à doser pour éviter sifflantes
+
+
+// ============================================================
+// 10) POTENTIOMETRE PITCH (A8)
+// ============================================================
+
+constexpr uint8_t PITCH_POT_PIN = A8;
+
+// Plage du pitch : à ajuster selon ton besoin
+// M2F = plutôt > 1, F2M = plutôt < 1
+float potMinSpeed = 0.55f;
+float potMaxSpeed = 1.90f;
+
+// Lissage (0..1) : plus grand = plus lisse mais plus lent
+float potSmooth = 0.08f;
+static float potFiltered = 0.0f;
+
+// Anti-jitter (évite d'update pour rien)
+constexpr float SPEED_EPS = 0.005f;
+
+// Fréquence de lecture
+constexpr uint32_t POT_PERIOD_MS = 15;
+static elapsedMillis potTimer;
+
+
+// ============================================================
+// 11) POTENTIOMETRE WET (A4)
+// ============================================================
+
+constexpr uint8_t WET_POT_PIN = A4;
+
+// Plage de mix wet
+float potMinWet = 0.0f;
+float potMaxWet = 1.0f;
+
+float wetPotSmooth = 0.08f;
+static float wetPotFiltered = 0.0f;
+
+constexpr float WET_EPS = 0.01f;
+
+constexpr uint32_t WET_POT_PERIOD_MS = 15;
+static elapsedMillis wetPotTimer;
+
+
+// ============================================================
+// 12) BOUTON MODE (A0) : toggle M2F <-> F2M (pas de bypass)
+// ============================================================
+
+constexpr uint8_t MODE_BTN_PIN = A0;
+constexpr uint32_t MODE_BTN_DEBOUNCE_MS = 35;
+static elapsedMillis modeBtnTimer;
+static bool modeBtnPrev = true; // INPUT_PULLUP => repos = HIGH
 
 
 // ============================================================
@@ -348,6 +401,56 @@ static void applyPreset(VoiceMode m) {
   applyDryWet(bypass, wet, outGain);
 }
 
+/*
+  updatePitchFromPot :
+  - lit le potentiomètre sur A8
+  - lisse la valeur
+  - mappe vers la plage potMinSpeed..potMaxSpeed
+  - applique le speed seulement si changement notable
+*/
+static void updatePitchFromPot() {
+  if (potTimer < POT_PERIOD_MS) return;
+  potTimer = 0;
+
+  int raw = analogRead(PITCH_POT_PIN);        // 0..4095 si analogReadResolution(12)
+  potFiltered += potSmooth * ((float)raw - potFiltered);
+
+  float x = potFiltered / 4095.0f;            // normalisé 0..1
+
+  float newSpeed = potMinSpeed + x * (potMaxSpeed - potMinSpeed);
+  newSpeed = clampf(newSpeed, 0.50f, 2.50f);
+
+  if (fabsf(newSpeed - speed) > SPEED_EPS) {
+    speed = newSpeed;
+    granular.setSpeed(speed);
+  }
+}
+
+/*
+  updateWetFromPot :
+  - lit le potentiomètre sur A4
+  - lisse la valeur
+  - mappe vers la plage potMinWet..potMaxWet
+  - applique le wet seulement si changement notable
+*/
+static void updateWetFromPot() {
+  if (wetPotTimer < WET_POT_PERIOD_MS) return;
+  wetPotTimer = 0;
+
+  int raw = analogRead(WET_POT_PIN);          // 0..4095 si analogReadResolution(12)
+  wetPotFiltered += wetPotSmooth * ((float)raw - wetPotFiltered);
+
+  float x = wetPotFiltered / 4095.0f;         // normalisé 0..1
+
+  float newWet = potMinWet + x * (potMaxWet - potMinWet);
+  newWet = clampf(newWet, 0.0f, 1.0f);
+
+  if (fabsf(newWet - wet) > WET_EPS) {
+    wet = newWet;
+    applyDryWet(bypass, wet, outGain);
+  }
+}
+
 
 // ============================================================
 // 7) AFFICHAGE SERIAL (menu + status)
@@ -448,9 +551,33 @@ void setup() {
   // Démarrage en Male->Female par défaut
   applyPreset(MODE_M2F);
   printStatus();
+
+  pinMode(PITCH_POT_PIN, INPUT);
+  pinMode(WET_POT_PIN, INPUT);
+  pinMode(MODE_BTN_PIN, INPUT_PULLUP);
+  analogReadResolution(12);   // 0..4095
+  analogReadAveraging(8);
+  potFiltered = (float)analogRead(PITCH_POT_PIN);
+  wetPotFiltered = (float)analogRead(WET_POT_PIN);
 }
 
 void loop() {
+  updatePitchFromPot();
+  updateWetFromPot();
+
+  // Bouton mode (A0) : bascule M2F <-> F2M
+  bool btnNow = digitalRead(MODE_BTN_PIN); // HIGH=repos, LOW=appuyé
+  if (btnNow != modeBtnPrev) {
+    if (modeBtnTimer > MODE_BTN_DEBOUNCE_MS) {
+      modeBtnTimer = 0;
+      modeBtnPrev = btnNow;
+      if (btnNow == LOW) {
+        if (mode == MODE_M2F) applyPreset(MODE_F2M);
+        else applyPreset(MODE_M2F);
+      }
+    }
+  }
+
   // Affiche l’état toutes les ~2s (utile pour voir CPU/clip)
   static elapsedMillis t;
   if (t > 2000) {
