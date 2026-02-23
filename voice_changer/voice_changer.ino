@@ -224,7 +224,7 @@ static bool modeBtnPrev = true; // INPUT_PULLUP => repos = HIGH
 // ============================================================
 
 bool autoMode = true;
-constexpr uint32_t AUTO_PERIOD_MS = 80;
+constexpr uint32_t AUTO_PERIOD_MS = 65;
 static elapsedMillis autoTimer;
 static float autoF0Smooth = 0.0f;
 static float autoLastF0 = -1.0f;
@@ -242,7 +242,7 @@ constexpr float AUTO_MIN_PEAK = 0.008f; // ignore si niveau trop faible
 constexpr float AUTO_MIN_RMS = 0.003f;
 constexpr float AUTO_YIN_THRESHOLD = 0.20f;
 constexpr float AUTO_MIN_PROB = 0.75f;
-constexpr uint8_t AUTO_CONFIRM_VOTES = 4; // 4 * 80ms ~= 320ms
+constexpr uint8_t AUTO_CONFIRM_VOTES = 3; // 3 * 65ms ~= 195ms
 
 
 // ============================================================
