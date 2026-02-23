@@ -73,6 +73,7 @@ AudioOutputI2S       out;
 AudioAnalyzePeak     peakIn;
 AudioAnalyzeRMS      rmsIn;
 AudioAnalyzeFFT1024  fftIn;
+AudioAnalyzeNoteFrequency noteFreqIn;
 
 // Contrôleur de la puce audio shield (gain micro, volume, etc.)
 AudioControlSGTL5000 sgtl5000;
@@ -88,6 +89,7 @@ AudioConnection c1(mic, 0, preamp, 0);
 // preamp -> analyzers (uniquement pour affichage, n’altère pas le son)
 AudioConnection c3(preamp, 0, peakIn, 0);
 AudioConnection c4(preamp, 0, rmsIn, 0);
+AudioConnection c4b(preamp, 0, noteFreqIn, 0);
 
 // preamp -> lowCut (entrée du filtre)
 AudioConnection cLC_in(preamp, 0, lowCut, 0);
@@ -222,15 +224,25 @@ static bool modeBtnPrev = true; // INPUT_PULLUP => repos = HIGH
 // ============================================================
 
 bool autoMode = true;
-constexpr uint32_t AUTO_PERIOD_MS = 120;
+constexpr uint32_t AUTO_PERIOD_MS = 80;
 static elapsedMillis autoTimer;
 static float autoF0Smooth = 0.0f;
+static float autoLastF0 = -1.0f;
+static float autoLastProb = 0.0f;
+static float autoLastPeak = 0.0f;
+static float autoLastRms = 0.0f;
+static uint8_t autoMaleVotes = 0;
+static uint8_t autoFemaleVotes = 0;
 
 // Hystérésis (évite le pompage)
-constexpr float AUTO_F0_LOW  = 155.0f;  // sous -> M2F
-constexpr float AUTO_F0_HIGH = 175.0f;  // au-dessus -> F2M
+constexpr float AUTO_F0_LOW  = 165.0f;  // sous -> M2F
+constexpr float AUTO_F0_HIGH = 165.0f;  // au-dessus -> F2M
 
-constexpr float AUTO_MIN_PEAK = 0.01f;  // ignore si niveau trop faible
+constexpr float AUTO_MIN_PEAK = 0.008f; // ignore si niveau trop faible
+constexpr float AUTO_MIN_RMS = 0.003f;
+constexpr float AUTO_YIN_THRESHOLD = 0.20f;
+constexpr float AUTO_MIN_PROB = 0.75f;
+constexpr uint8_t AUTO_CONFIRM_VOTES = 4; // 4 * 80ms ~= 320ms
 
 
 // ============================================================
@@ -505,28 +517,19 @@ static void updateWetFromPot() {
 
 /*
   estimateF0 :
-  - estime F0 via FFT dans 80..300 Hz
+  - estime F0 via AudioAnalyzeNoteFrequency (YIN)
   - retourne -1 si pas fiable
 */
-static float estimateF0() {
-  if (!fftIn.available()) return -1.0f;
+static float estimateF0(float *probOut) {
+  if (!noteFreqIn.available()) return -1.0f;
 
-  const float binHz = AUDIO_SAMPLE_RATE_EXACT / 1024.0f;
-  int binStart = (int)(80.0f / binHz);
-  int binEnd   = (int)(300.0f / binHz);
+  float prob = noteFreqIn.probability();
+  float f0 = noteFreqIn.read();
 
-  float maxVal = 0.0f;
-  int maxBin = -1;
-  for (int i = binStart; i <= binEnd; ++i) {
-    float v = fftIn.read(i);
-    if (v > maxVal) {
-      maxVal = v;
-      maxBin = i;
-    }
-  }
-
-  if (maxBin < 0 || maxVal < AUTO_MIN_PEAK) return -1.0f;
-  return maxBin * binHz;
+  if (probOut) *probOut = prob;
+  if (f0 < 80.0f || f0 > 320.0f) return -1.0f;
+  if (prob < AUTO_MIN_PROB) return -1.0f;
+  return f0;
 }
 
 /*
@@ -538,16 +541,45 @@ static void updateAutoMode() {
   if (autoTimer < AUTO_PERIOD_MS) return;
   autoTimer = 0;
 
-  float f0 = estimateF0();
+  if (peakIn.available()) autoLastPeak = peakIn.read();
+  if (rmsIn.available()) autoLastRms = rmsIn.read();
+
+  // Pas de voix claire : reset des votes pour eviter les bascules aleatoires.
+  if (autoLastPeak < AUTO_MIN_PEAK && autoLastRms < AUTO_MIN_RMS) {
+    autoMaleVotes = 0;
+    autoFemaleVotes = 0;
+    return;
+  }
+
+  float prob = 0.0f;
+  float f0 = estimateF0(&prob);
   if (f0 <= 0.0f) return;
+
+  autoLastF0 = f0;
+  autoLastProb = prob;
 
   if (autoF0Smooth <= 0.0f) autoF0Smooth = f0;
   autoF0Smooth += 0.20f * (f0 - autoF0Smooth);
 
-  if (mode == MODE_M2F && autoF0Smooth > AUTO_F0_HIGH) {
+  if (autoF0Smooth > AUTO_F0_HIGH) {
+    if (autoFemaleVotes < 255) autoFemaleVotes++;
+    if (autoMaleVotes > 0) autoMaleVotes--;
+  } else if (autoF0Smooth < AUTO_F0_LOW) {
+    if (autoMaleVotes < 255) autoMaleVotes++;
+    if (autoFemaleVotes > 0) autoFemaleVotes--;
+  } else {
+    if (autoMaleVotes > 0) autoMaleVotes--;
+    if (autoFemaleVotes > 0) autoFemaleVotes--;
+  }
+
+  if (mode == MODE_M2F && autoFemaleVotes >= AUTO_CONFIRM_VOTES) {
     applyModeSwitch(MODE_F2M);
-  } else if (mode == MODE_F2M && autoF0Smooth < AUTO_F0_LOW) {
+    autoFemaleVotes = 0;
+    autoMaleVotes = 0;
+  } else if (mode == MODE_F2M && autoMaleVotes >= AUTO_CONFIRM_VOTES) {
     applyModeSwitch(MODE_M2F);
+    autoMaleVotes = 0;
+    autoFemaleVotes = 0;
   }
 }
 
@@ -578,6 +610,7 @@ static void printMenu() {
   Serial.println("  + / - : outGain +/- 0.05");
   Serial.println("Other:");
   Serial.println("  b : bypass on/off");
+  Serial.println("  m : auto mode on/off");
   Serial.println("  s : status");
   Serial.println("  r : reset preset courant");
 }
@@ -593,6 +626,10 @@ static void printStatus() {
   Serial.print("  lowCut="); Serial.print(lowCutHz, 0); Serial.print("Hz");
   Serial.print("  outGain="); Serial.print(outGain, 2);
   Serial.print("  bypass="); Serial.println(bypass ? "ON" : "OFF");
+  Serial.print("autoMode="); Serial.print(autoMode ? "ON" : "OFF");
+  Serial.print("  F0="); Serial.print(autoLastF0, 1); Serial.print("Hz");
+  Serial.print("  prob="); Serial.print(autoLastProb, 2);
+  Serial.print("  F0smoothed="); Serial.println(autoF0Smooth, 1);
 
   // Affiche peak/RMS si disponibles (la lib met à jour périodiquement)
   if (peakIn.available()) {
@@ -646,6 +683,7 @@ void setup() {
   applyDryWet(bypass, wet, outGain);
 
   fftIn.windowFunction(AudioWindowHanning1024);
+  noteFreqIn.begin(AUTO_YIN_THRESHOLD);
 
   Serial.println("\n=== Voice Gender Switcher (0/1/2) ===");
   printMenu();
@@ -776,6 +814,13 @@ void loop() {
     case 'b':
       bypass = !bypass;
       applyDryWet(bypass, wet, outGain);
+      break;
+
+    // ------------------ Auto detect toggle ------------------
+    case 'm':
+      autoMode = !autoMode;
+      autoMaleVotes = 0;
+      autoFemaleVotes = 0;
       break;
 
     // ------------------ Reset preset courant ------------------
