@@ -667,7 +667,7 @@ void setup() {
 
   // Gains hardware : à ajuster selon micro + distance
   sgtl5000.micGain(8);      // 6..15 typique
-  sgtl5000.volume(0.65);    // casque
+  sgtl5000.volume(0.85);    // casque
 
   // Gain logiciel (laisser à 1 au début)
   preamp.gain(1.0f);
